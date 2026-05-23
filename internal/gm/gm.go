@@ -657,23 +657,64 @@ func (s ConversationStatus) String() string {
 }
 
 // UpdateConversationStatus archives, restores, deletes, or moves a
-// conversation to spam/blocked. The change is round-tripped to the phone
-// via libgm; the local SQLite store is updated by the sync pump as the
-// resulting Conversation event flows back through dispatch.
+// conversation to spam/blocked. Delete uses a separate protocol path
+// because the relay requires the participant phone number in a
+// dedicated DeleteConversationData payload — the status-update path
+// that archive/unarchive/spam use is silently rejected for delete.
+//
+// The change is round-tripped to the phone via libgm; the local SQLite
+// store is updated by the sync pump as the resulting Conversation event
+// flows back through dispatch.
 //
 // The libgm long-poll must be Connected; the runWithConnectedClient
 // helper in cmd/ ensures this. Requires the writer/--read-only=false
 // gate on the CLI side.
+//
+// IMPORTANT: libgm's UpdateConversationResponse carries a Success bool
+// that this method checks. Both the status-update path and the delete
+// path inspect resp.GetSuccess() and return a descriptive error when
+// the phone rejects the request.
 func (c *Client) UpdateConversationStatus(conversationID string, status ConversationStatus) error {
 	if conversationID == "" {
 		return fmt.Errorf("conversation id is required")
 	}
+
+	if status == ConversationDeleted {
+		phone, err := c.lookupParticipantPhone(conversationID)
+		if err != nil {
+			return fmt.Errorf("delete %s: %w", conversationID, err)
+		}
+		req := &gmproto.UpdateConversationRequest{
+			Action:         gmproto.ConversationActionStatus_DELETE,
+			ConversationID: conversationID,
+			Data: &gmproto.UpdateConversationRequest_DeleteData{
+			DeleteData: &gmproto.DeleteConversationData{
+				ConversationID: conversationID,
+				Phone:          phone,
+			},
+			},
+		}
+		resp, err := c.libgm.UpdateConversation(req)
+		if err != nil {
+			return fmt.Errorf("libgm delete conversation %s (phone=%q): %w", conversationID, phone, err)
+		}
+		if !resp.GetSuccess() {
+			return fmt.Errorf("phone rejected delete of conversation %s (phone=%q); response.success=false", conversationID, phone)
+		}
+		return nil
+	}
+
+	// Status-update path for archive / unarchive / spam / blocked.
+	// The current proto wraps UpdateConversationData inside an
+	// UpdateConversationRequest_UpdateData oneof variant.
 	req := &gmproto.UpdateConversationRequest{
 		ConversationID: conversationID,
-		Data: &gmproto.UpdateConversationData{
-			ConversationID: conversationID,
-			Data: &gmproto.UpdateConversationData_Status{
-				Status: gmproto.ConversationStatus(status),
+		Data: &gmproto.UpdateConversationRequest_UpdateData{
+			UpdateData: &gmproto.UpdateConversationData{
+				ConversationID: conversationID,
+				Data: &gmproto.UpdateConversationData_Status{
+					Status: gmproto.ConversationStatus(status),
+				},
 			},
 		},
 	}
@@ -682,9 +723,35 @@ func (c *Client) UpdateConversationStatus(conversationID string, status Conversa
 		return fmt.Errorf("libgm update conversation %s -> %s: %w", conversationID, status, err)
 	}
 	if !resp.GetSuccess() {
-		return fmt.Errorf("phone rejected update of conversation %s to status %s (response.success=false; this typically means the transition isn't allowed for the current folder, e.g., DELETED on a spam-folder conv may require moving to inbox first)", conversationID, status)
+		return fmt.Errorf("phone rejected update of conversation %s to status %s (response.success=false)", conversationID, status)
 	}
 	return nil
+}
+
+// lookupParticipantPhone fetches the conversation from the relay and
+// returns the first visible non-me participant's phone number (E.164 or
+// shortcode). Used for delete operations that require a phone to scope
+// the relay-side cleanup. Returns an empty string with no error if no
+// participant has a phone — the relay treats empty phone as best-effort.
+func (c *Client) lookupParticipantPhone(conversationID string) (string, error) {
+	conv, err := c.libgm.GetConversation(conversationID)
+	if err != nil {
+		return "", fmt.Errorf("get conversation for phone lookup: %w", err)
+	}
+	for _, p := range conv.GetParticipants() {
+		if p.GetIsMe() {
+			continue
+		}
+		if !p.GetIsVisible() {
+			continue
+		}
+		if num := p.GetID().GetNumber(); num != "" {
+			return num, nil
+		}
+	}
+	// No phone-bearing participant found. The proto says phone is
+	// optional; return empty and let the relay decide.
+	return "", nil
 }
 
 // ConversationFolder mirrors gmproto.ListConversationsRequest_Folder so
