@@ -457,8 +457,12 @@ func (c *Client) UpdateConversationStatus(conversationID string, status Conversa
 			},
 		},
 	}
-	if _, err := c.libgm.UpdateConversation(req); err != nil {
+	resp, err := c.libgm.UpdateConversation(req)
+	if err != nil {
 		return fmt.Errorf("libgm update conversation %s -> %s: %w", conversationID, status, err)
+	}
+	if !resp.GetSuccess() {
+		return fmt.Errorf("phone rejected update of conversation %s to status %s (response.success=false; this typically means the transition isn't allowed for the current folder, e.g., DELETED on a spam-folder conv may require moving to inbox first)", conversationID, status)
 	}
 	return nil
 }
