@@ -612,6 +612,120 @@ func (c *Client) DownloadMedia(mediaID string, key []byte) ([]byte, error) {
 	return c.libgm.DownloadMedia(mediaID, key)
 }
 
+// ConversationStatus mirrors gmproto.ConversationStatus so the CLI surface
+// doesn't have to import gmproto directly. The values match the wire enum
+// exactly; UpdateConversationStatus enforces that at the boundary.
+type ConversationStatus int
+
+const (
+	// ConversationActive restores a conversation to the inbox folder.
+	ConversationActive ConversationStatus = 1
+	// ConversationArchived moves a conversation to the archive folder. The
+	// underlying messages and contacts are preserved; the conversation
+	// simply hides from the default inbox view. Reversible via
+	// ConversationActive.
+	ConversationArchived ConversationStatus = 2
+	// ConversationDeleted removes the conversation from the phone (and
+	// therefore from gmcli's local archive on next sync). Irreversible
+	// from gmcli's side.
+	ConversationDeleted ConversationStatus = 3
+	// ConversationSpamFolder moves the conversation to the spam folder.
+	ConversationSpamFolder ConversationStatus = 5
+	// ConversationBlockedFolder moves the conversation to the blocked
+	// folder and implicitly blocks the sender on the phone.
+	ConversationBlockedFolder ConversationStatus = 6
+)
+
+// String returns the human-readable name for a ConversationStatus. Useful
+// for CLI/JSON output where we want stable strings rather than the
+// numeric enum values.
+func (s ConversationStatus) String() string {
+	switch s {
+	case ConversationActive:
+		return "active"
+	case ConversationArchived:
+		return "archived"
+	case ConversationDeleted:
+		return "deleted"
+	case ConversationSpamFolder:
+		return "spam"
+	case ConversationBlockedFolder:
+		return "blocked"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(s))
+	}
+}
+
+// UpdateConversationStatus archives, restores, deletes, or moves a
+// conversation to spam/blocked. The change is round-tripped to the phone
+// via libgm; the local SQLite store is updated by the sync pump as the
+// resulting Conversation event flows back through dispatch.
+//
+// The libgm long-poll must be Connected; the runWithConnectedClient
+// helper in cmd/ ensures this. Requires the writer/--read-only=false
+// gate on the CLI side.
+func (c *Client) UpdateConversationStatus(conversationID string, status ConversationStatus) error {
+	if conversationID == "" {
+		return fmt.Errorf("conversation id is required")
+	}
+	req := &gmproto.UpdateConversationRequest{
+		ConversationID: conversationID,
+		Data: &gmproto.UpdateConversationData{
+			ConversationID: conversationID,
+			Data: &gmproto.UpdateConversationData_Status{
+				Status: gmproto.ConversationStatus(status),
+			},
+		},
+	}
+	if _, err := c.libgm.UpdateConversation(req); err != nil {
+		return fmt.Errorf("libgm update conversation %s -> %s: %w", conversationID, status, err)
+	}
+	return nil
+}
+
+// ConversationFolder mirrors gmproto.ListConversationsRequest_Folder so
+// CLI callers don't need to import gmproto.
+type ConversationFolder int
+
+const (
+	// FolderInbox is the default visible inbox (status=ACTIVE).
+	FolderInbox ConversationFolder = 1
+	// FolderArchive lists conversations the user has archived (status=ARCHIVED).
+	FolderArchive ConversationFolder = 2
+	// FolderSpamBlocked lists conversations in the spam or blocked folders.
+	FolderSpamBlocked ConversationFolder = 5
+)
+
+// String returns the human-readable name for a ConversationFolder.
+func (f ConversationFolder) String() string {
+	switch f {
+	case FolderInbox:
+		return "inbox"
+	case FolderArchive:
+		return "archive"
+	case FolderSpamBlocked:
+		return "spam_blocked"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(f))
+	}
+}
+
+// ListConversationsFromFolder pulls a page of conversations from one of
+// the phone-side folders (inbox / archive / spam-blocked). Unlike the
+// store-backed `chats list` command, this reads live from the phone via
+// libgm — useful for inspecting folders that are not synced into the
+// local archive (archive and spam are not pulled by default).
+func (c *Client) ListConversationsFromFolder(folder ConversationFolder, count int) (*gmproto.ListConversationsResponse, error) {
+	if count <= 0 {
+		count = 50
+	}
+	resp, err := c.libgm.ListConversations(count, gmproto.ListConversationsRequest_Folder(folder))
+	if err != nil {
+		return nil, fmt.Errorf("libgm list conversations folder=%s: %w", folder, err)
+	}
+	return resp, nil
+}
+
 // AuthSnapshot returns a deep copy of the current AuthData by JSON
 // round-trip. Useful for diagnostics; do not modify.
 func (c *Client) AuthSnapshot() (*libgm.AuthData, error) {

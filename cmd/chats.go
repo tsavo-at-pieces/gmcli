@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
+	"github.com/fdsouvenir/gmcli/internal/gm"
 	"github.com/fdsouvenir/gmcli/internal/output"
 	"github.com/fdsouvenir/gmcli/internal/store"
 )
@@ -16,10 +18,15 @@ import (
 func chatsCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "chats",
-		Short: "List and inspect conversations",
+		Short: "List, inspect, and manage conversations (archive / unarchive / delete)",
 	}
 	c.AddCommand(chatsListCmd())
 	c.AddCommand(chatsShowCmd())
+	c.AddCommand(chatsArchiveCmd())
+	c.AddCommand(chatsUnarchiveCmd())
+	c.AddCommand(chatsDeleteCmd())
+	c.AddCommand(chatsSpamCmd())
+	c.AddCommand(chatsRemoteListCmd())
 	return c
 }
 
@@ -156,6 +163,217 @@ func boolMark(b bool, mark string) string {
 		return mark
 	}
 	return ""
+}
+
+// chatsArchiveCmd moves one or more conversations to the archive folder
+// on the phone. Reversible via `gmcli chats unarchive`. Requires
+// --read-only=false. The local SQLite store reflects the new status on
+// the next sync event for each affected conversation.
+func chatsArchiveCmd() *cobra.Command {
+	return chatsStatusCmd(chatsStatusOpts{
+		use:       "archive <conversation-id>...",
+		short:     "Move conversations to the archive folder on the phone (reversible)",
+		status:    gm.ConversationArchived,
+		verb:      "archived",
+		batchVerb: "archive",
+	})
+}
+
+// chatsUnarchiveCmd restores one or more conversations from the archive
+// folder back to the inbox. Requires --read-only=false.
+func chatsUnarchiveCmd() *cobra.Command {
+	return chatsStatusCmd(chatsStatusOpts{
+		use:       "unarchive <conversation-id>...",
+		short:     "Restore conversations from the archive folder back to the inbox",
+		status:    gm.ConversationActive,
+		verb:      "unarchived",
+		batchVerb: "unarchive",
+	})
+}
+
+// chatsDeleteCmd deletes one or more conversations on the phone. This is
+// irreversible from gmcli's side — once the phone confirms the deletion,
+// the conversation is also removed from the local archive on next sync.
+// Requires --read-only=false plus an additional --yes confirmation to
+// reduce the blast radius of typos.
+func chatsDeleteCmd() *cobra.Command {
+	c := chatsStatusCmd(chatsStatusOpts{
+		use:       "delete <conversation-id>...",
+		short:     "Delete conversations on the phone (irreversible; requires --yes)",
+		status:    gm.ConversationDeleted,
+		verb:      "deleted",
+		batchVerb: "delete",
+		requireYes: true,
+	})
+	return c
+}
+
+// chatsSpamCmd moves conversations into the spam folder on the phone.
+// Useful as a milder alternative to delete: the conversation is hidden
+// from the inbox but kept around in case it was mis-classified.
+func chatsSpamCmd() *cobra.Command {
+	return chatsStatusCmd(chatsStatusOpts{
+		use:       "spam <conversation-id>...",
+		short:     "Move conversations to the spam folder on the phone",
+		status:    gm.ConversationSpamFolder,
+		verb:      "marked as spam",
+		batchVerb: "mark-as-spam",
+	})
+}
+
+// chatsStatusOpts parameterises chatsStatusCmd so archive/unarchive/
+// delete/spam can share a single implementation. The differences are
+// strictly UX (use-line, short help, verb in success output) plus the
+// underlying gm.ConversationStatus we send to libgm.
+type chatsStatusOpts struct {
+	use        string
+	short      string
+	status     gm.ConversationStatus
+	verb       string
+	batchVerb  string
+	requireYes bool
+}
+
+// chatsStatusCmd is the shared implementation for archive/unarchive/
+// delete/spam. Each accepts one or more conversation IDs as positional
+// args, requires --read-only=false, and (for delete) requires --yes.
+// Failures on individual conversations do not abort the batch; the
+// command returns a non-zero exit only if at least one update failed.
+func chatsStatusCmd(opts chatsStatusOpts) *cobra.Command {
+	var yes bool
+	c := &cobra.Command{
+		Use:   opts.use,
+		Short: opts.short,
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := requireWritable(); err != nil {
+				return err
+			}
+			if opts.requireYes && !yes {
+				return fmt.Errorf("%s is irreversible; re-run with --yes to confirm", opts.batchVerb)
+			}
+			return runWithConnectedClient(func(ctx context.Context, client *gm.Client, _ *store.Store) error {
+				type result struct {
+					ConversationID string `json:"conversation_id"`
+					Status         string `json:"status"`
+					Updated        bool   `json:"updated"`
+					Error          string `json:"error,omitempty"`
+				}
+				results := make([]result, 0, len(args))
+				var firstErr error
+				for _, convID := range args {
+					convID = strings.TrimSpace(convID)
+					if convID == "" {
+						continue
+					}
+					err := client.UpdateConversationStatus(convID, opts.status)
+					r := result{
+						ConversationID: convID,
+						Status:         opts.status.String(),
+						Updated:        err == nil,
+					}
+					if err != nil {
+						r.Error = err.Error()
+						if firstErr == nil {
+							firstErr = err
+						}
+					}
+					results = append(results, r)
+				}
+				if flags.jsonOut {
+					if err := output.JSON(os.Stdout, results); err != nil {
+						return err
+					}
+				} else {
+					for _, r := range results {
+						if r.Updated {
+							fmt.Fprintf(os.Stderr, "%s conversation %s (status=%s)\n", opts.verb, r.ConversationID, r.Status)
+						} else {
+							fmt.Fprintf(os.Stderr, "FAILED to %s conversation %s: %s\n", opts.batchVerb, r.ConversationID, r.Error)
+						}
+					}
+				}
+				return firstErr
+			})
+		},
+	}
+	if opts.requireYes {
+		c.Flags().BoolVar(&yes, "yes", false, "confirm the irreversible operation (required for delete)")
+	}
+	return c
+}
+
+// chatsRemoteListCmd lists conversations LIVE from the phone (rather than
+// from the local SQLite store), filtered by folder. Use this to inspect
+// archived or spam-folder conversations, which are not synced into the
+// local archive by default and therefore don't show up in
+// `gmcli chats list`. Read-only — does not require --read-only=false.
+func chatsRemoteListCmd() *cobra.Command {
+	var folderName string
+	var count int
+	c := &cobra.Command{
+		Use:   "remote-list",
+		Short: "List conversations LIVE from the phone, filtered by folder (inbox / archive / spam)",
+		Long: "Pulls conversation metadata directly from the phone via libgm, " +
+			"bypassing the local SQLite archive. Useful for inspecting the " +
+			"archive or spam folders, which are not synced into the local " +
+			"store by default. Use `--folder archive` to find conv_ids you " +
+			"can then `unarchive`.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			folder, err := parseFolder(folderName)
+			if err != nil {
+				return err
+			}
+			return runWithConnectedClient(func(ctx context.Context, client *gm.Client, _ *store.Store) error {
+				resp, err := client.ListConversationsFromFolder(folder, count)
+				if err != nil {
+					return err
+				}
+				convs := resp.GetConversations()
+				if flags.jsonOut {
+					return output.JSON(os.Stdout, convs)
+				}
+				if len(convs) == 0 {
+					fmt.Fprintf(os.Stderr, "(no conversations in folder %s)\n", folder)
+					return nil
+				}
+				rows := make([][]string, 0, len(convs))
+				for _, conv := range convs {
+					kind := "1:1"
+					if conv.GetType() == 2 { // GROUP per gmproto.ConversationType
+						kind = "grp"
+					}
+					rows = append(rows, []string{
+						conv.GetConversationID(),
+						kind,
+						truncate(conv.GetName(), 40),
+						fmt.Sprintf("%d", conv.GetLastMessageTimestamp()),
+					})
+				}
+				return output.Table(os.Stdout,
+					[]string{"conv_id", "kind", "name", "last_msg_ts_ms"},
+					rows)
+			})
+		},
+	}
+	c.Flags().StringVar(&folderName, "folder", "archive", "folder to list: inbox, archive, or spam")
+	c.Flags().IntVar(&count, "limit", 50, "max conversations to return")
+	return c
+}
+
+// parseFolder maps the user-facing --folder string to the libgm folder
+// enum. Accepts case-insensitive aliases for the obvious cases.
+func parseFolder(name string) (gm.ConversationFolder, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "inbox", "in":
+		return gm.FolderInbox, nil
+	case "archive", "archived":
+		return gm.FolderArchive, nil
+	case "spam", "blocked", "spam_blocked", "spam-blocked":
+		return gm.FolderSpamBlocked, nil
+	default:
+		return 0, fmt.Errorf("unknown folder %q (expected: inbox, archive, spam)", name)
+	}
 }
 
 // participantSummary parses the participants_json blob and returns a comma
