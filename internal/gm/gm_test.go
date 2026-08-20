@@ -728,6 +728,87 @@ func testGaiaAuth(account string) *libgm.AuthData {
 	return auth
 }
 
+func TestGetOrCreateConversationNormalizesAndDedupsPhones(t *testing.T) {
+	var got []string
+	c := &Client{
+		getOrCreateHook: func(req *gmproto.GetOrCreateConversationRequest) (*gmproto.GetOrCreateConversationResponse, error) {
+			for _, n := range req.GetNumbers() {
+				got = append(got, n.GetNumber())
+			}
+			return &gmproto.GetOrCreateConversationResponse{
+				Status: gmproto.GetOrCreateConversationResponse_SUCCESS,
+				Conversation: &gmproto.Conversation{
+					ConversationID: "conv-new",
+					Name:           "Test Contact",
+				},
+			}, nil
+		},
+	}
+	res, err := c.GetOrCreateConversation(context.Background(), []string{"(202) 555-0142", "+12025550142"}, "")
+	if err != nil {
+		t.Fatalf("get or create: %v", err)
+	}
+	if res.Conversation.GetConversationID() != "conv-new" {
+		t.Fatalf("conversation id: got %q want conv-new", res.Conversation.GetConversationID())
+	}
+	if len(got) != 1 || got[0] != "+12025550142" {
+		t.Fatalf("numbers: got %v want [+12025550142]", got)
+	}
+}
+
+func TestGetOrCreateConversationRetriesRCSGroupCreate(t *testing.T) {
+	calls := 0
+	c := &Client{
+		getOrCreateHook: func(req *gmproto.GetOrCreateConversationRequest) (*gmproto.GetOrCreateConversationResponse, error) {
+			calls++
+			if calls == 1 {
+				if req.GetCreateRCSGroup() {
+					t.Fatalf("first call should not set CreateRCSGroup")
+				}
+				return &gmproto.GetOrCreateConversationResponse{
+					Status: gmproto.GetOrCreateConversationResponse_CREATE_RCS,
+				}, nil
+			}
+			if !req.GetCreateRCSGroup() {
+				t.Fatalf("retry should set CreateRCSGroup")
+			}
+			if req.GetRCSGroupName() != "Dinner" {
+				t.Fatalf("group name: got %q want Dinner", req.GetRCSGroupName())
+			}
+			return &gmproto.GetOrCreateConversationResponse{
+				Status: gmproto.GetOrCreateConversationResponse_SUCCESS,
+				Conversation: &gmproto.Conversation{
+					ConversationID: "grp-1",
+					IsGroupChat:    true,
+					Name:           "Dinner",
+				},
+			}, nil
+		},
+	}
+	res, err := c.GetOrCreateConversation(context.Background(), []string{"+13015550101", "+13015550102"}, "Dinner")
+	if err != nil {
+		t.Fatalf("get or create: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls: got %d want 2", calls)
+	}
+	if res.Conversation.GetConversationID() != "grp-1" {
+		t.Fatalf("conversation id: got %q want grp-1", res.Conversation.GetConversationID())
+	}
+}
+
+func TestGetOrCreateConversationRejectsGroupNameOnDM(t *testing.T) {
+	c := &Client{
+		getOrCreateHook: func(*gmproto.GetOrCreateConversationRequest) (*gmproto.GetOrCreateConversationResponse, error) {
+			t.Fatal("should not call relay")
+			return nil, nil
+		},
+	}
+	if _, err := c.GetOrCreateConversation(context.Background(), []string{"+13015550101"}, "Nope"); err == nil {
+		t.Fatal("expected group-name error")
+	}
+}
+
 func testSettings(participantID string) *gmproto.Settings {
 	return &gmproto.Settings{
 		SIMCards: []*gmproto.SIMCard{{

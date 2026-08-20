@@ -71,6 +71,7 @@ type Client struct {
 
 	sendMessageHook     func(*gmproto.SendMessageRequest) (*gmproto.SendMessageResponse, error)
 	getConversationHook func(string) (*gmproto.Conversation, error)
+	getOrCreateHook     func(*gmproto.GetOrCreateConversationRequest) (*gmproto.GetOrCreateConversationResponse, error)
 	sendMetadataWait    time.Duration
 }
 
@@ -425,6 +426,78 @@ func (c *Client) getConversation(ctx context.Context, conversationID string) (*g
 	return c.libgm.GetConversation(ctx, conversationID)
 }
 
+func (c *Client) getOrCreate(ctx context.Context, req *gmproto.GetOrCreateConversationRequest) (*gmproto.GetOrCreateConversationResponse, error) {
+	if c.getOrCreateHook != nil {
+		return c.getOrCreateHook(req)
+	}
+	return c.libgm.GetOrCreateConversation(ctx, req)
+}
+
+// GetOrCreateResult is a successful GetOrCreateConversation round-trip.
+type GetOrCreateResult struct {
+	Conversation *gmproto.Conversation
+	Status       string
+}
+
+// GetOrCreateConversation finds or starts a Google Messages thread for the
+// given phone numbers. One number is a 1:1 DM; two or more plus an optional
+// groupName create a group. Phone numbers are normalized to E.164.
+//
+// This is the missing counterpart to SendText: SendMessage requires an
+// existing conversation_id. The phone relay's GET_OR_CREATE_CONVERSATION
+// action is how the official web client (and mautrix-gmessages) starts a
+// chat with someone who is not already in the inbox.
+func (c *Client) GetOrCreateConversation(ctx context.Context, phones []string, groupName string) (*GetOrCreateResult, error) {
+	numbers := make([]*gmproto.ContactNumber, 0, len(phones))
+	seen := make(map[string]struct{}, len(phones))
+	for _, raw := range phones {
+		n, err := NormalizePhone(raw)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		numbers = append(numbers, &gmproto.ContactNumber{
+			MysteriousInt: 2,
+			Number:        n,
+			Number2:       n,
+		})
+	}
+	if len(numbers) == 0 {
+		return nil, fmt.Errorf("at least one phone number is required")
+	}
+	if groupName != "" && len(numbers) < 2 {
+		return nil, fmt.Errorf("RCS group name requires at least two phone numbers")
+	}
+
+	req := &gmproto.GetOrCreateConversationRequest{Numbers: numbers}
+	if groupName != "" {
+		req.RCSGroupName = proto.String(groupName)
+	}
+
+	resp, err := c.getOrCreate(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("libgm get-or-create conversation: %w", err)
+	}
+	if resp.GetStatus() == gmproto.GetOrCreateConversationResponse_CREATE_RCS {
+		req.CreateRCSGroup = proto.Bool(true)
+		resp, err = c.getOrCreate(ctx, req)
+		if err != nil {
+			return nil, fmt.Errorf("libgm get-or-create RCS group: %w", err)
+		}
+	}
+	conv := resp.GetConversation()
+	if conv.GetConversationID() == "" {
+		return nil, fmt.Errorf("get-or-create conversation returned no conversation id (status=%s)", resp.GetStatus().String())
+	}
+	return &GetOrCreateResult{
+		Conversation: conv,
+		Status:       resp.GetStatus().String(),
+	}, nil
+}
+
 func (c *Client) sendMetadataWaitDuration() time.Duration {
 	if c.sendMetadataWait > 0 {
 		return c.sendMetadataWait
@@ -674,13 +747,13 @@ func (s ConversationStatus) String() string {
 // that this method checks. Both the status-update path and the delete
 // path inspect resp.GetSuccess() and return a descriptive error when
 // the phone rejects the request.
-func (c *Client) UpdateConversationStatus(conversationID string, status ConversationStatus) error {
+func (c *Client) UpdateConversationStatus(ctx context.Context, conversationID string, status ConversationStatus) error {
 	if conversationID == "" {
 		return fmt.Errorf("conversation id is required")
 	}
 
 	if status == ConversationDeleted {
-		phone, err := c.lookupParticipantPhone(conversationID)
+		phone, err := c.lookupParticipantPhone(ctx, conversationID)
 		if err != nil {
 			return fmt.Errorf("delete %s: %w", conversationID, err)
 		}
@@ -688,13 +761,13 @@ func (c *Client) UpdateConversationStatus(conversationID string, status Conversa
 			Action:         gmproto.ConversationActionStatus_DELETE,
 			ConversationID: conversationID,
 			Data: &gmproto.UpdateConversationRequest_DeleteData{
-			DeleteData: &gmproto.DeleteConversationData{
-				ConversationID: conversationID,
-				Phone:          phone,
-			},
+				DeleteData: &gmproto.DeleteConversationData{
+					ConversationID: conversationID,
+					Phone:          phone,
+				},
 			},
 		}
-		resp, err := c.libgm.UpdateConversation(req)
+		resp, err := c.libgm.UpdateConversation(ctx, req)
 		if err != nil {
 			return fmt.Errorf("libgm delete conversation %s (phone=%q): %w", conversationID, phone, err)
 		}
@@ -718,7 +791,7 @@ func (c *Client) UpdateConversationStatus(conversationID string, status Conversa
 			},
 		},
 	}
-	resp, err := c.libgm.UpdateConversation(req)
+	resp, err := c.libgm.UpdateConversation(ctx, req)
 	if err != nil {
 		return fmt.Errorf("libgm update conversation %s -> %s: %w", conversationID, status, err)
 	}
@@ -733,8 +806,8 @@ func (c *Client) UpdateConversationStatus(conversationID string, status Conversa
 // shortcode). Used for delete operations that require a phone to scope
 // the relay-side cleanup. Returns an empty string with no error if no
 // participant has a phone — the relay treats empty phone as best-effort.
-func (c *Client) lookupParticipantPhone(conversationID string) (string, error) {
-	conv, err := c.libgm.GetConversation(conversationID)
+func (c *Client) lookupParticipantPhone(ctx context.Context, conversationID string) (string, error) {
+	conv, err := c.libgm.GetConversation(ctx, conversationID)
 	if err != nil {
 		return "", fmt.Errorf("get conversation for phone lookup: %w", err)
 	}
@@ -786,11 +859,11 @@ func (f ConversationFolder) String() string {
 // store-backed `chats list` command, this reads live from the phone via
 // libgm — useful for inspecting folders that are not synced into the
 // local archive (archive and spam are not pulled by default).
-func (c *Client) ListConversationsFromFolder(folder ConversationFolder, count int) (*gmproto.ListConversationsResponse, error) {
+func (c *Client) ListConversationsFromFolder(ctx context.Context, folder ConversationFolder, count int) (*gmproto.ListConversationsResponse, error) {
 	if count <= 0 {
 		count = 50
 	}
-	resp, err := c.libgm.ListConversations(count, gmproto.ListConversationsRequest_Folder(folder))
+	resp, err := c.libgm.ListConversations(ctx, count, gmproto.ListConversationsRequest_Folder(folder))
 	if err != nil {
 		return nil, fmt.Errorf("libgm list conversations folder=%s: %w", folder, err)
 	}

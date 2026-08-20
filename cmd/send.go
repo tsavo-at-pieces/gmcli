@@ -75,18 +75,25 @@ type sendInspectSIMInfo struct {
 
 func sendTextCmd() *cobra.Command {
 	var to, message, replyTo, sendMode string
+	var phones []string
 	c := &cobra.Command{
 		Use:   "text",
 		Short: "Send a text message into a conversation",
-		Long: "Sends `--message` to the conversation identified by `--to` " +
-			"(a conversation_id; find one with `gmcli chats list`). " +
-			"Optionally `--reply-to <message_id>` to render the message as a " +
-			"quoted reply. Requires `--read-only=false` to be passed at the " +
-			"root since gmcli is read-only by default.",
+		Long: "Sends `--message` to `--to` (a conversation_id from `gmcli chats list`) " +
+			"or to `--phone` (get-or-create a thread by E.164 / US 10-digit number). " +
+			"Do not pass a conversation_id as `--phone` — those IDs are short numeric " +
+			"strings and will be rejected. Optionally `--reply-to <message_id>`. " +
+			"Requires `--read-only=false`.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if to == "" || message == "" {
-				return usageErrorf("--to and --message are required")
+			if message == "" {
+				return usageErrorf("--message is required")
+			}
+			if to == "" && len(phones) == 0 {
+				return usageErrorf("either --to (conversation_id) or --phone is required")
+			}
+			if to != "" && len(phones) > 0 {
+				return usageErrorf("--to and --phone are mutually exclusive")
 			}
 			if err := requireWritable(); err != nil {
 				return err
@@ -101,7 +108,18 @@ func sendTextCmd() *cobra.Command {
 						return fmt.Errorf("request phone send settings refresh: %w", err)
 					}
 				}
-				res, err := c.SendTextWithMode(ctx, to, message, replyTo, gm.SendMode(sendMode))
+				convID := to
+				if len(phones) > 0 {
+					created, err := c.GetOrCreateConversation(ctx, phones, "")
+					if err != nil {
+						return err
+					}
+					if err := st.UpsertConversation(ctx, gmsync.ConversationFromProto(created.Conversation, "gm")); err != nil {
+						return err
+					}
+					convID = created.Conversation.GetConversationID()
+				}
+				res, err := c.SendTextWithMode(ctx, convID, message, replyTo, gm.SendMode(sendMode))
 				if err != nil {
 					return err
 				}
@@ -116,6 +134,7 @@ func sendTextCmd() *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&to, "to", "", "conversation_id (find one via `gmcli chats list`)")
+	c.Flags().StringArrayVar(&phones, "phone", nil, "phone number to get-or-create then send (E.164 or US 10-digit)")
 	c.Flags().StringVar(&message, "message", "", "message body")
 	c.Flags().StringVar(&replyTo, "reply-to", "", "optional message_id to quote-reply to")
 	c.Flags().StringVar(&sendMode, "send-mode", string(gm.SendModeAuto), "request shape: auto, settings, or legacy")

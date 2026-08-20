@@ -84,9 +84,10 @@ initial beta releases.
   is available when you want to inspect or refresh the preferred metadata path.
 - History backfill is best-effort and depends on what Google Messages returns
   through the paired phone.
-- The phone must be online for sync, backfill, sends, and media downloads.
+- The phone must be online for sync, backfill, sends, media downloads, and `chats create`.
 - Account pairing requires short-lived access to Google Account cookies from a
   private browser window. They are as sensitive as a signed-in browser session.
+- `send text --to` requires an existing conversation_id. Use `chats create --phone` or `send text --phone` to start a new thread (conversation ids are short numbers and cannot be used as phones).
 - The SQLite database is local but unencrypted. Use filesystem encryption if
   you need at-rest protection.
 - The protocol depends on the unofficial `libgm` reverse-engineered Google
@@ -212,6 +213,8 @@ gmcli sync send-settings
 gmcli send preflight
 gmcli send inspect --to <conv-id>
 gmcli --read-only=false send text --to <conv-id> --message "on my way"
+gmcli --read-only=false chats create --phone +13015550101
+gmcli --read-only=false send text --phone +13015550101 --message "hey"
 gmcli --read-only=false send react --message <msg-id> --emoji "👍"
 gmcli media download --message <msg-id>
 # `send text` only reports success after Google Messages echoes the outgoing

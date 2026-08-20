@@ -167,16 +167,7 @@ func (p *Pump) onConversation(ctx context.Context, c *gmproto.Conversation) {
 	if c.GetConversationID() == "" {
 		return
 	}
-	row := store.Conversation{
-		ID:                c.GetConversationID(),
-		SourcePlatform:    p.platform,
-		Name:              c.GetName(),
-		IsGroup:           c.GetIsGroupChat(),
-		ParticipantsJSON:  participantsJSON(c.GetParticipants()),
-		LastMessageTimeMS: normalizeTimestampMS(c.GetLastMessageTimestamp()),
-		Unread:            c.GetUnread(),
-		Pinned:            c.GetPinned(),
-	}
+	row := ConversationFromProto(c, p.platform)
 	if err := p.store.UpsertConversation(ctx, row); err != nil {
 		p.logger.Error().Err(err).Str("conv_id", row.ID).Msg("Upsert conversation failed")
 		return
@@ -341,6 +332,25 @@ func replyToID(m *gmproto.Message) *string {
 		}
 	}
 	return nil
+}
+
+// ConversationFromProto maps a live libgm conversation into the store row
+// shape. Used by the sync pump and by chats create / send --phone so a
+// newly opened thread is queryable before the next full sync.
+func ConversationFromProto(c *gmproto.Conversation, platform string) store.Conversation {
+	if platform == "" {
+		platform = "gm"
+	}
+	return store.Conversation{
+		ID:                c.GetConversationID(),
+		SourcePlatform:    platform,
+		Name:              c.GetName(),
+		IsGroup:           c.GetIsGroupChat(),
+		ParticipantsJSON:  participantsJSON(c.GetParticipants()),
+		LastMessageTimeMS: normalizeTimestampMS(c.GetLastMessageTimestamp()),
+		Unread:            c.GetUnread(),
+		Pinned:            c.GetPinned(),
+	}
 }
 
 // participantsJSON produces a compact JSON array of participant summaries

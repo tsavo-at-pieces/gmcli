@@ -13,20 +13,66 @@ import (
 	"github.com/fdsouvenir/gmcli/internal/gm"
 	"github.com/fdsouvenir/gmcli/internal/output"
 	"github.com/fdsouvenir/gmcli/internal/store"
+	gmsync "github.com/fdsouvenir/gmcli/internal/sync"
 )
 
 func chatsCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "chats",
-		Short: "List, inspect, and manage conversations (archive / unarchive / delete)",
+		Short: "List, inspect, create, and manage conversations (archive / unarchive / delete)",
 	}
 	c.AddCommand(chatsListCmd())
 	c.AddCommand(chatsShowCmd())
+	c.AddCommand(chatsCreateCmd())
 	c.AddCommand(chatsArchiveCmd())
 	c.AddCommand(chatsUnarchiveCmd())
 	c.AddCommand(chatsDeleteCmd())
 	c.AddCommand(chatsSpamCmd())
 	c.AddCommand(chatsRemoteListCmd())
+	return c
+}
+
+func chatsCreateCmd() *cobra.Command {
+	var phones []string
+	var name string
+	c := &cobra.Command{
+		Use:   "create",
+		Short: "Get or create a conversation by phone number",
+		Long: "Asks the phone relay to find or start a thread for `--phone` " +
+			"(repeatable for groups). Conversation IDs in Google Messages are " +
+			"short numeric strings, so this is the only way to text someone who " +
+			"is not already in `gmcli chats list`. Requires `--read-only=false`.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(phones) == 0 {
+				return fmt.Errorf("--phone is required")
+			}
+			if err := requireWritable(); err != nil {
+				return err
+			}
+			return runWithConnectedClient(func(ctx context.Context, client *gm.Client, st *store.Store) error {
+				res, err := client.GetOrCreateConversation(ctx, phones, name)
+				if err != nil {
+					return err
+				}
+				if err := st.UpsertConversation(ctx, gmsync.ConversationFromProto(res.Conversation, "gm")); err != nil {
+					return err
+				}
+				if flags.jsonOut {
+					return output.JSON(os.Stdout, map[string]any{
+						"conversation_id": res.Conversation.GetConversationID(),
+						"name":            res.Conversation.GetName(),
+						"is_group":        res.Conversation.GetIsGroupChat(),
+						"status":          res.Status,
+					})
+				}
+				fmt.Fprintf(os.Stderr, "Conversation %s (%s, status=%s)\n",
+					res.Conversation.GetConversationID(), res.Conversation.GetName(), res.Status)
+				return nil
+			})
+		},
+	}
+	c.Flags().StringArrayVar(&phones, "phone", nil, "phone number (E.164 or US 10-digit; repeat for groups)")
+	c.Flags().StringVar(&name, "name", "", "optional RCS group name (requires two or more --phone)")
 	return c
 }
 
@@ -198,11 +244,11 @@ func chatsUnarchiveCmd() *cobra.Command {
 // reduce the blast radius of typos.
 func chatsDeleteCmd() *cobra.Command {
 	c := chatsStatusCmd(chatsStatusOpts{
-		use:       "delete <conversation-id>...",
-		short:     "Delete conversations on the phone (irreversible; requires --yes)",
-		status:    gm.ConversationDeleted,
-		verb:      "deleted",
-		batchVerb: "delete",
+		use:        "delete <conversation-id>...",
+		short:      "Delete conversations on the phone (irreversible; requires --yes)",
+		status:     gm.ConversationDeleted,
+		verb:       "deleted",
+		batchVerb:  "delete",
 		requireYes: true,
 	})
 	return c
@@ -266,7 +312,7 @@ func chatsStatusCmd(opts chatsStatusOpts) *cobra.Command {
 					if convID == "" {
 						continue
 					}
-					err := client.UpdateConversationStatus(convID, opts.status)
+					err := client.UpdateConversationStatus(ctx, convID, opts.status)
 					r := result{
 						ConversationID: convID,
 						Status:         opts.status.String(),
@@ -325,7 +371,7 @@ func chatsRemoteListCmd() *cobra.Command {
 				return err
 			}
 			return runWithConnectedClient(func(ctx context.Context, client *gm.Client, _ *store.Store) error {
-				resp, err := client.ListConversationsFromFolder(folder, count)
+				resp, err := client.ListConversationsFromFolder(ctx, folder, count)
 				if err != nil {
 					return err
 				}

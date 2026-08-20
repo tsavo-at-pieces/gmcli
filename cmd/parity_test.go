@@ -40,6 +40,13 @@ func TestReadOnlyGatesWrites(t *testing.T) {
 	if !strings.Contains(err.Error(), "read-only") {
 		t.Fatalf("expected read-only error, got: %v", err)
 	}
+	_, err = runCmdAllowError(t, dir, "chats", "create", "--phone", "+13015550101")
+	if err == nil {
+		t.Fatal("expected read-only error for chats create, got nil")
+	}
+	if !strings.Contains(err.Error(), "read-only") {
+		t.Fatalf("expected read-only error for chats create, got: %v", err)
+	}
 }
 
 func TestAliasRoundTrip(t *testing.T) {
