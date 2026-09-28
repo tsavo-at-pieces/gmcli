@@ -393,6 +393,9 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// TimestampMS normalizes a libgm message timestamp to Unix milliseconds.
+func TimestampMS(ts int64) int64 { return normalizeTimestampMS(ts) }
+
 func normalizeTimestampMS(ts int64) int64 {
 	// libgm/gmproto timestamps have appeared as both millis and micros across
 	// event types. Current Unix milliseconds are ~1e12; microseconds are ~1e15.

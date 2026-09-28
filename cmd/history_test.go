@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 )
 
 func TestHistoryBackfillResultJSONIsUnambiguous(t *testing.T) {
@@ -37,5 +39,20 @@ func TestHistoryBackfillResultJSONIsUnambiguous(t *testing.T) {
 	}
 	if strings.Contains(out, `"imported"`) {
 		t.Fatalf("json should not expose ambiguous imported field: %s", out)
+	}
+}
+
+func TestPageReachesSince(t *testing.T) {
+	since := int64(1_789_567_795_000) // 2026-09-16T10:09:55-04:00
+	newer := &gmproto.Message{Timestamp: (since + 60_000) * 1000}
+	older := &gmproto.Message{Timestamp: (since - 60_000) * 1000}
+	if pageReachesSince([]*gmproto.Message{newer}, since) {
+		t.Fatal("page of newer messages should not reach since")
+	}
+	if !pageReachesSince([]*gmproto.Message{newer, older}, since) {
+		t.Fatal("page containing an older message should reach since")
+	}
+	if pageReachesSince([]*gmproto.Message{older}, 0) {
+		t.Fatal("zero since should never stop paging")
 	}
 }

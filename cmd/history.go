@@ -38,16 +38,20 @@ func historyCmd() *cobra.Command {
 }
 
 func historyBackfillCmd() *cobra.Command {
-	var chat string
+	var chat, since string
 	var requests int
 	var count int64
+	var fromLatest bool
 	c := &cobra.Command{
 		Use:   "backfill",
 		Short: "Fetch older messages for one conversation",
 		Long: "Fetch older messages for one conversation. --requests limits how many " +
 			"FetchMessages calls gmcli makes, and --count limits how many message " +
-			"records each call asks the phone for. JSON output separates protocol " +
-			"records processed from messages added to the target conversation.",
+			"records each call asks the phone for. By default paging starts at the " +
+			"oldest stored message and walks further back; --from-latest starts at " +
+			"the newest message instead, which fills gaps left by a sync outage, and " +
+			"--since stops once a page reaches that time. JSON output separates " +
+			"protocol records processed from messages added to the target conversation.",
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if chat == "" {
@@ -59,7 +63,18 @@ func historyBackfillCmd() *cobra.Command {
 			if count <= 0 {
 				count = 50
 			}
-			res, err := runHistoryBackfill(chat, requests, count)
+			if since != "" && !fromLatest {
+				return usageErrorf("--since requires --from-latest")
+			}
+			sinceTime, err := parseFlagTime(since)
+			if err != nil {
+				return usageErrorf("--since: %v", err)
+			}
+			var sinceMS int64
+			if !sinceTime.IsZero() {
+				sinceMS = sinceTime.UnixMilli()
+			}
+			res, err := runHistoryBackfill(chat, requests, count, fromLatest, sinceMS)
 			if err != nil {
 				return err
 			}
@@ -74,10 +89,12 @@ func historyBackfillCmd() *cobra.Command {
 	c.Flags().StringVar(&chat, "chat", "", "conversation_id to backfill")
 	c.Flags().IntVar(&requests, "requests", 10, "max FetchMessages calls to make for the target conversation")
 	c.Flags().Int64Var(&count, "count", 50, "max message records to request per FetchMessages call")
+	c.Flags().BoolVar(&fromLatest, "from-latest", false, "page back from the newest message instead of the oldest stored one")
+	c.Flags().StringVar(&since, "since", "", "with --from-latest, stop once a page reaches this time (YYYY-MM-DD or RFC3339)")
 	return c
 }
 
-func runHistoryBackfill(chat string, requests int, count int64) (historyBackfillResult, error) {
+func runHistoryBackfill(chat string, requests int, count int64, fromLatest bool, sinceMS int64) (historyBackfillResult, error) {
 	layout, err := resolveLayout()
 	if err != nil {
 		return historyBackfillResult{}, err
@@ -114,9 +131,12 @@ func runHistoryBackfill(chat string, requests int, count int64) (historyBackfill
 		return historyBackfillResult{}, fmt.Errorf("conversation %s is not in the local store; run `gmcli sync` first", chat)
 	}
 
-	cursor, err := oldestCursor(ctx, st, chat)
-	if err != nil {
-		return historyBackfillResult{}, err
+	var cursor *gmproto.Cursor
+	if !fromLatest {
+		cursor, err = oldestCursor(ctx, st, chat)
+		if err != nil {
+			return historyBackfillResult{}, err
+		}
 	}
 
 	before, err := st.CountMessagesForConversation(ctx, chat)
@@ -136,7 +156,7 @@ func runHistoryBackfill(chat string, requests int, count int64) (historyBackfill
 		imported := pump.ImportMessages(ctx, msgs)
 		res.SyncRecordsProcessed += imported
 		next := resp.GetCursor()
-		if len(msgs) == 0 || sameCursor(cursor, next) {
+		if len(msgs) == 0 || sameCursor(cursor, next) || pageReachesSince(msgs, sinceMS) {
 			break
 		}
 		cursor = next
@@ -148,6 +168,20 @@ func runHistoryBackfill(chat string, requests int, count int64) (historyBackfill
 	res.MessagesAfter = after
 	res.MessagesAddedForChat = after - before
 	return res, nil
+}
+
+// pageReachesSince reports whether a FetchMessages page already contains a
+// message at or before sinceMS, so paging further back is unnecessary.
+func pageReachesSince(msgs []*gmproto.Message, sinceMS int64) bool {
+	if sinceMS <= 0 {
+		return false
+	}
+	for _, m := range msgs {
+		if ts := gmsync.TimestampMS(m.GetTimestamp()); ts > 0 && ts <= sinceMS {
+			return true
+		}
+	}
+	return false
 }
 
 func oldestCursor(ctx context.Context, st *store.Store, chat string) (*gmproto.Cursor, error) {
